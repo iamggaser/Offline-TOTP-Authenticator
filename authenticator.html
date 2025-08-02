@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <title>TOTP Authenticator</title>
+  <style>
+    body { font-family: sans-serif; background: #f3f3f3; padding: 20px; max-width: 800px; margin: auto; }
+    h1 { text-align: center; }
+    .form-group input { width: 100%; padding: 6px; margin: 4px 0; }
+    .form-group label { font-weight: bold; }
+    .entry { background: #fff; padding: 12px; margin: 6px 0; border-left: 4px solid #2196f3; box-shadow: 0 2px 4px rgba(0,0,0,0.1); position: relative; }
+    .entry-title { font-size: 1.1em; font-weight: bold; margin-bottom: 4px; }
+    .entry-meta { color: #666; font-size: 0.9em; }
+    .code-row { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+    .code { font-size: 1.6em; font-weight: bold; }
+    .countdown { font-size: 0.9em; color: #888; margin-left: 10px; }
+    .copy-btn, .delete-btn { background: #2196f3; color: white; border: none; padding: 4px 8px; cursor: pointer; margin-left: 6px; border-radius: 4px; }
+    .delete-btn { background: #f44336; }
+    .accordion { background: #ddd; padding: 10px; cursor: pointer; font-weight: bold; border: none; width: 100%; text-align: left; margin-top: 12px; }
+    .panel { display: none; margin-bottom: 10px; }
+    #searchInput { padding: 8px; width: 100%; margin: 12px 0; font-size: 1em; }
+  </style>
+</head>
+<body>
+  <h1>TOTP Authenticator</h1>
+
+  <div class="form-group">
+    <label>Tên tài khoản</label>
+    <input id="labelInput" placeholder="VD: Gmail" />
+    <label>Nhóm/Mục</label>
+    <input id="groupInput" placeholder="VD: Google / Công việc" />
+    <label>Secret hoặc otpauth://</label>
+    <input id="secretInput" placeholder="Base32 hoặc otpauth://..." />
+    <button onclick="addEntry()">➕ Thêm</button>
+    <button onclick="document.getElementById('qrInput').click()">📷 Quét QR ảnh</button>
+    <input type="file" id="qrInput" accept="image/*" onchange="handleQRUpload(event)" style="display:none" />
+  </div>
+
+  <input id="searchInput" placeholder="🔍 Tìm theo tên hoặc nhóm..." oninput="render()" />
+
+  <div id="accounts"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+  <script>
+    const base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    function base32ToBytes(base32) {
+      let bits = '';
+      base32 = base32.toUpperCase().replace(/[^A-Z2-7]/g, '');
+      for (let c of base32) bits += base32Chars.indexOf(c).toString(2).padStart(5, '0');
+      let bytes = [];
+      for (let i = 0; i + 8 <= bits.length; i += 8)
+        bytes.push(parseInt(bits.slice(i, i + 8), 2));
+      return new Uint8Array(bytes);
+    }
+
+    function getOTP(secretBytes, time) {
+      const msg = new ArrayBuffer(8), view = new DataView(msg);
+      view.setUint32(4, time);
+      return crypto.subtle.importKey('raw', secretBytes, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign'])
+        .then(key => crypto.subtle.sign('HMAC', key, msg))
+        .then(hmac => {
+          const bytes = new Uint8Array(hmac);
+          const offset = bytes[19] & 0xf;
+          const binCode = ((bytes[offset] & 0x7f) << 24)
+                        | ((bytes[offset + 1] & 0xff) << 16)
+                        | ((bytes[offset + 2] & 0xff) << 8)
+                        | (bytes[offset + 3] & 0xff);
+          return (binCode % 1e6).toString().padStart(6, '0');
+        });
+    }
+
+    let entries = JSON.parse(localStorage.getItem('totp_accounts') || '[]');
+    function save() {
+      localStorage.setItem('totp_accounts', JSON.stringify(entries));
+    }
+
+    function addEntry() {
+      const label = document.getElementById('labelInput').value.trim();
+      const group = document.getElementById('groupInput').value.trim();
+      const input = document.getElementById('secretInput').value.trim();
+      let secret = '';
+      if (input.startsWith('otpauth://')) {
+        try {
+          const url = new URL(input);
+          const params = new URLSearchParams(url.search);
+          secret = params.get('secret') || '';
+        } catch (e) { alert("Không thể đọc otpauth://"); return; }
+      } else {
+        secret = input;
+      }
+      if (!secret) return alert("Secret không hợp lệ.");
+      entries.push({ label, group, secret });
+      save();
+      render();
+    }
+
+    function removeEntry(index) {
+      if (confirm("Xoá tài khoản này?")) {
+        entries.splice(index, 1);
+        save();
+        render();
+      }
+    }
+
+    function copyToClipboard(text, button) {
+      navigator.clipboard.writeText(text).then(() => {
+        const old = button.textContent;
+        button.textContent = "✔ Copied!";
+        setTimeout(() => button.textContent = old, 1000);
+      });
+    }
+
+    function render() {
+      const container = document.getElementById('accounts');
+      const search = document.getElementById('searchInput')?.value?.trim().toLowerCase() || '';
+      container.innerHTML = '';
+      const time = Math.floor(Date.now() / 1000 / 30);
+
+      let filtered = entries
+        .filter(e =>
+          e.label.toLowerCase().includes(search) ||
+          e.group.toLowerCase().includes(search)
+        );
+
+      let groups = {};
+      filtered.forEach((e, i) => {
+        const g = e.group || 'Khác';
+        if (!groups[g]) groups[g] = [];
+        groups[g].push({ ...e, index: entries.indexOf(e) });
+      });
+
+      const sortedGroups = Object.keys(groups).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+      sortedGroups.forEach(groupName => {
+        const btn = document.createElement('button');
+        btn.className = 'accordion';
+        btn.textContent = `▸ ${groupName} (${groups[groupName].length})`;
+        btn.onclick = () => {
+          const panel = btn.nextElementSibling;
+          const open = panel.style.display === 'block';
+          panel.style.display = open ? 'none' : 'block';
+          btn.textContent = `${open ? '▾' : '▸'} ${groupName} (${groups[groupName].length})`;
+        };
+        container.appendChild(btn);
+
+        const panel = document.createElement('div');
+        panel.className = 'panel';
+        panel.style.display = 'none';
+
+        const groupEntries = groups[groupName].sort((a, b) => a.label.toLowerCase().localeCompare(b.label.toLowerCase()));
+        groupEntries.forEach(entry => {
+          const div = document.createElement('div');
+          div.className = 'entry';
+
+          const title = document.createElement('div');
+          title.className = 'entry-title';
+          title.textContent = entry.label || '(Không tên)';
+
+          const codeRow = document.createElement('div');
+          codeRow.className = 'code-row';
+
+          const code = document.createElement('div');
+          code.className = 'code';
+          code.textContent = '------';
+
+          const countdown = document.createElement('span');
+          countdown.className = 'countdown';
+
+          const copyBtn = document.createElement('button');
+          copyBtn.className = 'copy-btn';
+          copyBtn.textContent = 'Copy';
+
+          const delBtn = document.createElement('button');
+          delBtn.className = 'delete-btn';
+          delBtn.textContent = 'Xoá';
+          delBtn.onclick = () => removeEntry(entry.index);
+
+          codeRow.appendChild(code);
+          codeRow.appendChild(countdown);
+          codeRow.appendChild(copyBtn);
+          codeRow.appendChild(delBtn);
+
+          div.appendChild(title);
+          div.appendChild(codeRow);
+          panel.appendChild(div);
+
+          const secretBytes = base32ToBytes(entry.secret);
+          const update = () => {
+            const now = Math.floor(Date.now() / 1000);
+            const step = Math.floor(now / 30);
+            const remaining = 30 - (now % 30);
+            countdown.textContent = `(${remaining}s)`;
+            getOTP(secretBytes, step).then(otp => {
+              code.textContent = otp;
+              copyBtn.onclick = () => copyToClipboard(otp, copyBtn);
+            });
+          };
+          update();
+          setInterval(update, 1000);
+        });
+
+        container.appendChild(panel);
+      });
+    }
+
+    function handleQRUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imgData.data, canvas.width, canvas.height);
+          if (code && code.data.startsWith('otpauth://')) {
+            document.getElementById('secretInput').value = code.data;
+          } else {
+            alert("Không đọc được mã QR hợp lệ.");
+          }
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    render();
+  </script>
+</body>
+</html>
